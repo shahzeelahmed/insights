@@ -78,7 +78,7 @@ def _statement_findings(s: dict, env: dict) -> list[dict]:
 
 def _cores(s: dict, env: dict) -> list[dict]:
     alone, cpus = s["alone"], _cpus(env)
-    if not cpus or alone["cores"] < 0.75 * cpus:
+    if not cpus or alone["cores"] < 0.75 * cpus or alone["wall_s"] < MIN_WALL_SECONDS:
         return []
     text = f"Alone, it kept {alone['cores']} of {cpus} CPUs busy for {alone['wall_s']}s."
     return [_finding("cores", 3, text, digest=s["digest"], cores=alone["cores"], wall_s=alone["wall_s"])]
@@ -154,14 +154,19 @@ def _experiments(s: dict) -> list[dict]:
     if alone < MIN_WALL_SECONDS:
         return []
     for sweep in (s.get("experiments") or {}).get("concurrency") or []:
-        if sweep["copies"] > 1 and alone:
-            slowdown = round(sweep["slowest_s"] / alone, 1)
-            text = f"With {sweep['copies']} copies at once, each took up to {slowdown}x as long as alone."
-            found.append(
-                _finding(
-                    "concurrency", 2, text, digest=s["digest"], copies=sweep["copies"], slowdown=slowdown
-                )
-            )
+        if sweep["copies"] < 2:
+            continue
+        if sweep["errors"]:
+            # a copy that failed fast makes the slowest copy look quick, so the error is the finding
+            error = next(r["error"] for r in sweep["runs"] if r["error"])
+            text = f"With {sweep['copies']} copies at once, {sweep['errors']} failed: {error}"
+            found.append(_finding("concurrency_failed", 5, text, digest=s["digest"], copies=sweep["copies"]))
+            continue
+        slowdown = round(sweep["slowest_s"] / alone, 1)
+        text = f"With {sweep['copies']} copies at once, each took up to {slowdown}x as long as alone."
+        found.append(
+            _finding("concurrency", 2, text, digest=s["digest"], copies=sweep["copies"], slowdown=slowdown)
+        )
     return found
 
 
