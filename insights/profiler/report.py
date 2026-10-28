@@ -43,6 +43,7 @@ def summarize(
         "by_chart": _by(queries, "chart"),
         "statements": _statements(queries),
         "failures": _failures(records),
+        "unfinished": _unfinished(records, until),
     }
 
 
@@ -51,37 +52,48 @@ def summarize(
 
 def _pair(found: list[dict], since: float, until: float) -> list[dict]:
     ends = {e["id"]: e for e in found if e["kind"].endswith(".end")}
-    last_seen = _last_event_by_process(found)
+    by_thread = _events_by_thread(found)
     records = []
     for start in found:
         if start["kind"] not in PAIRED or not since <= start["ts"] <= until:
             continue
         end = ends.get(start["id"])
         record = {**start, **(end or {}), "kind": start["kind"], "ts": start["ts"]}
-        record["state"] = _state(start, end, last_seen)
+        record["state"] = _state(start, end, by_thread)
         records.append(record)
     return records
 
 
-def _last_event_by_process(found: list[dict]) -> dict[tuple, float]:
-    last: dict[tuple, float] = {}
+def _events_by_thread(found: list[dict]) -> dict[tuple, list[dict]]:
+    """Each thread's own events, by the process that ran it and when it started."""
+    threads: dict[tuple, list[dict]] = defaultdict(list)
     for e in found:
         if "pid" in e:
-            key = (e["pid"], e.get("pid_started"))
-            last[key] = max(last.get(key, 0), e["ts"])
-    return last
+            threads[(e["pid"], e.get("pid_started"), e.get("thread"))].append(e)
+    return threads
 
 
-def _state(start: dict, end: dict | None, last_seen: dict[tuple, float]) -> str:
-    """ok, failed, or — with no end — what became of the process."""
+def _state(start: dict, end: dict | None, by_thread: dict[tuple, list[dict]]) -> str:
+    """ok, failed, or — with no end — what became of the thread that held it.
+
+    A worker can serve several requests at once on threads of its own, so
+    whether the work moved on is read off its thread, not off its process. A
+    thread that went on to other work lost only this end. One that did not is
+    still at it while its process lives, and was killed with it otherwise.
+    """
     if end is not None:
         if start["kind"] == "request":
             return "ok" if (end.get("status") or 500) < 400 else "failed"
         return "ok" if end.get("ok", True) else "failed"
-    process = (start["pid"], start.get("pid_started"))
-    if last_seen.get(process, 0) > start["ts"]:
+    thread = by_thread.get((start["pid"], start.get("pid_started"), start.get("thread")), [])
+    if any(e["ts"] > start["ts"] and not _part_of(e, start) for e in thread):
         return "end not recorded"
-    return "running" if _alive(*process) else "killed"
+    return "running" if _alive(start["pid"], start.get("pid_started")) else "killed"
+
+
+def _part_of(event: dict, start: dict) -> bool:
+    """Whether an event is the work itself, or work done inside it."""
+    return start["id"] in (event["id"], event.get("request"), event.get("job"))
 
 
 def _alive(pid: int, started: float | None) -> bool:
@@ -231,6 +243,30 @@ def _failures(records: list[dict]) -> list[dict]:
         {k: r.get(k) for k in keep if r.get(k) is not None}
         for r in sorted(failed, key=lambda r: -r["ts"])[:TOP]
     ]
+
+
+def _unfinished(records: list[dict], until: float) -> list[dict]:
+    """Work with no end, oldest first: what is still running, stuck or was killed."""
+    open_work = [r for r in records if r["state"] in ("running", "killed", "end not recorded")]
+    keep = (
+        "kind",
+        "state",
+        "ts",
+        "pid",
+        "thread",
+        "path",
+        "dashboard",
+        "chart",
+        "chart_name",
+        "sql",
+        "user",
+        "request",
+    )
+    rows = [
+        {**{k: r.get(k) for k in keep if r.get(k) is not None}, "age_s": round(until - r["ts"], 1)}
+        for r in open_work
+    ]
+    return sorted(rows, key=lambda r: -r["age_s"])[:TOP]
 
 
 # --- over time ----------------------------------------------------------------

@@ -111,6 +111,34 @@ class TestProfilerRecorder(InsightsIntegrationTestCase):
         self.assertEqual(found["queries"]["by_state"], {"killed": 1, "end not recorded": 1})
 
     # @feature data-store.profiler-recorder
+    def test_work_still_on_one_thread_reads_as_running_while_its_worker_serves_others(self):
+        this_process, mine, base = process_stamp(), uuid4().hex, time.time() - 10
+        held, other = {**this_process, "thread": 1}, {**this_process, "thread": 2}
+        request = {
+            "id": uuid4().hex[:16],
+            "kind": "request",
+            "ts": base,
+            "site": frappe.local.site,
+            "path": "/api/method/insights.api.view.get_chart_data",
+            "dashboard": mine,
+            **held,
+        }
+        events.write(request)
+        # the request's own query, started after it on its thread, is part of it
+        events.write(self.query_start("cccc", base + 1, mine, request=request["id"], **held))
+        # another thread of the same worker goes on serving
+        events.write({"id": uuid4().hex[:16], "kind": "connect", "ts": base + 2, **other, "ok": True})
+
+        found = self.recorded(dashboard=mine, since=base - 1)
+        self.assertEqual(
+            (found["requests"]["by_status"], found["queries"]["by_state"]), ({"running": 1}, {"running": 1})
+        )
+        self.assertEqual(
+            [(u["kind"], u["state"]) for u in found["unfinished"]],
+            [("request", "running"), ("query", "running")],
+        )
+
+    # @feature data-store.profiler-recorder
     def test_identical_statements_running_at_once_count_as_duplicates(self):
         this_process, mine, base = process_stamp(), uuid4().hex, time.time() - 10
         runs = [("same", 0.1, 3.0), ("same", 0.5, 1.0), ("other", 0.6, 1.0), ("same", 4.0, 1.0)]

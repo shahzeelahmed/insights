@@ -116,18 +116,44 @@ def _tree_size(path: str) -> int:
 
 
 def web_tier() -> dict:
-    """Gunicorn's workers, threads and timeout, read off its own command line."""
-    for proc in psutil.process_iter(["cmdline"]):
+    """The bench's gunicorn: its workers, threads and timeout.
+
+    A host can run other gunicorns, such as Frappe Cloud's own admin service,
+    so only the one serving `frappe.app` counts. Each setting is read off its
+    command line, or off the config file `-c` names when the command line does
+    not carry it.
+    """
+    for proc in psutil.process_iter(["cmdline", "cwd"]):
         cmdline = proc.info["cmdline"] or []
-        if _is_gunicorn_master(proc, cmdline):
+        if any("frappe.app" in part for part in cmdline) and _is_gunicorn_master(proc, cmdline):
+            config = _gunicorn_config(cmdline, proc.info.get("cwd"))
             return {
-                "workers": _flag(cmdline, "-w", "--workers") or 1,
-                "threads": _flag(cmdline, "--threads") or 1,
-                "timeout": _flag(cmdline, "-t", "--timeout") or 30,
-                "worker_class": _flag(cmdline, "-k", "--worker-class", cast=str) or "sync",
+                "workers": _flag(cmdline, "-w", "--workers") or config.get("workers") or 1,
+                "threads": _flag(cmdline, "--threads") or config.get("threads") or 1,
+                "timeout": _flag(cmdline, "-t", "--timeout") or config.get("timeout") or 30,
+                "worker_class": _flag(cmdline, "-k", "--worker-class", cast=str)
+                or config.get("worker_class")
+                or "sync",
                 "cmdline": " ".join(cmdline)[:500],
             }
-    return {"error": "no gunicorn master is visible from this process"}
+    return {"error": "no gunicorn serving frappe.app is visible from this process"}
+
+
+def _gunicorn_config(cmdline: list[str], cwd: str | None) -> dict:
+    """The literal settings a gunicorn config file assigns, as `name = value` lines."""
+    path = _flag(cmdline, "-c", "--config", cast=str)
+    if not path:
+        return {}
+    path = os.path.join(cwd or "", path)
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:  # nosemgrep - the config file gunicorn itself was started with
+        text = f.read()
+    found = {}
+    for name, value in re.findall(r"^(workers|threads|timeout|worker_class)\s*=\s*([^#\n]+)", text, re.M):
+        value = value.strip().strip("'\"")
+        found[name] = int(value) if value.isdigit() else value
+    return found
 
 
 def _is_gunicorn_master(proc: psutil.Process, cmdline: list[str]) -> bool:
@@ -167,7 +193,8 @@ def bench_processes() -> list[dict]:
 def _role(proc: psutil.Process) -> str | None:
     text = " ".join(proc.info.get("cmdline") or [])
     if "gunicorn" in text:
-        return "web"
+        # Frappe Cloud runs its own admin service under gunicorn as well
+        return "web" if "frappe.app" in text else "other gunicorn"
     if "redis-server" in text:
         return "redis"
     if "socketio" in text:
